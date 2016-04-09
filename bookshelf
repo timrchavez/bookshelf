@@ -1,0 +1,112 @@
+#!/usr/bin/env python
+
+import math
+import random
+import requests
+import ConfigParser
+
+from goodreads import client
+
+from model import db, Book
+
+
+def books(user, shelves=["currently-reading", "read"], per_page=20):
+    books = []
+    for shelf in user.shelves():
+        if shelf["name"] in shelves:
+            book_count = int(shelf["book_count"]["#text"])
+            num_pages = int(math.ceil(book_count / float(per_page)))
+            for book in user.books(shelf, num_pages):
+                books.append(book)
+    return books
+
+
+def _query_books(api_url, params):
+    resp = requests.get(api_url, params=params)
+    if resp.status_code == 200:
+        resp = resp.json()
+        if resp["totalItems"] > 0:
+            item = resp["items"][0]
+            resp = requests.get("{0}/{1}".format(api_url, item["id"]))
+            return resp.json()
+    return None
+
+
+def query_books_by_isbn(isbn, api_url, key):
+    params = {
+        "q": "isbn:" + isbn,
+        "key": key
+    }
+    return _query_books(api_url, params)
+
+
+def query_books_by_title(title, api_url, key):
+    params = {
+        "q": title,
+        "filter": "partial",
+        "key": key
+    }
+    return _query_books(api_url, params)
+
+
+def main():
+    config = ConfigParser.ConfigParser()
+    config.read("bookshelf.conf")
+
+    db.connect()
+    db.create_tables([Book], safe=True)
+
+    gc = client.GoodreadsClient(
+        config.get("goodreads", "key"), config.get("goodreads", "secret"))
+    gc.authenticate(
+        config.get("goodreads", "access_token"),
+        config.get("goodreads", "access_token_secret"))
+
+    user = gc.auth_user()
+
+    for book in books(user):
+        title = book.title
+        isbn = (None if "@nil" in book.isbn and book.isbn["@nil"]
+                else book.isbn)
+        isbn13 = (None if "@nil" in book.isbn13 and book.isbn13["@nil"]
+                  else book.isbn13)
+        if isbn13:
+            isbn = isbn13
+
+        book, created = Book.get_or_create(title=title)
+        if created:
+            book.save()
+
+        book.isbn = isbn or isbn13
+
+        google_book = None
+        google_api_url = config.get("google", "api_url")
+        google_dev_key = config.get("google", "key")
+        if book.isbn:
+            google_book = query_books_by_isbn(
+                book.isbn, google_api_url, google_dev_key)
+        if google_book is None:
+            google_book = query_books_by_title(
+                book.title, google_api_url, google_dev_key)
+        if google_book:
+            if "volumeInfo" in google_book:
+                volume_info = google_book["volumeInfo"]
+                if "dimensions" in volume_info:
+                    dimensions = volume_info["dimensions"]
+                    if "width" in dimensions:
+                        book.width = dimensions["width"].strip("cm")
+                    if "height" in dimensions:
+                        book.height = dimensions["height"].strip("cm")
+                    if "thickness" in dimensions:
+                        book.thickness = dimensions["thickness"].strip("cm")
+                else:
+                    print book.title
+                    book.thickness = round(random.uniform(2.0, 4.0), 1)
+            else:
+                book.thickness = round(random.uniform(2.0, 4.0), 1)
+        else:
+            print "Can't find {0} by isbn or title".format(book.title)
+        book.save()
+
+if __name__ == "__main__":
+    main()
